@@ -32,6 +32,168 @@ import multiprocessing
 import traceback
 from multiprocessing import Pool
 import os, sys
+from copy import deepcopy
+import numpy as np
+import numpy.ma as ma
+from scipy.ndimage import label
+from skimage.segmentation import flood_fill
+
+def corner_crop(x, src_start, patch_size, default_fill = 0.0):
+    def _clamp(v, a, b):
+        s=deepcopy(v)
+        if s<a: s=a
+        if s>b: s=b
+        return s
+    def _clamp3(v,a,b):
+        s=[0,0,0]
+        s[0] = _clamp(v[0],a[0],b[0])
+        s[1] = _clamp(v[1],a[1],b[1])
+        s[2] = _clamp(v[2],a[2],b[2])
+        return s
+    def _add3(a,b):
+        return [a[0]+b[0],a[1]+b[1],a[2]+b[2]]
+    def _sub3(a,b):
+        return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]
+    src_end = [
+        src_start[0] + patch_size[0],
+        src_start[1] + patch_size[1],
+        src_start[2] + patch_size[2]
+    ]
+    src_actual_start = _clamp3(src_start, (0,0,0), x.shape)
+    src_actual_end   = _clamp3(src_end,   (0,0,0), x.shape)
+    src_actual_size  = _sub3(src_actual_end, src_actual_start)
+    dst_start = _sub3(src_actual_start, src_start)
+    dst_end = _add3(dst_start, src_actual_size)
+    y = np.zeros(patch_size)
+    y.fill(default_fill)
+    y[dst_start[0]:dst_end[0], dst_start[1]:dst_end[1], dst_start[2]:dst_end[2]] = \
+        x[src_actual_start[0]:src_actual_end[0], src_actual_start[1]:src_actual_end[1], src_actual_start[2]:src_actual_end[2]]
+    return y
+
+def center_crop(x, center_pos, patch_size, default_fill = 0.0):
+    src_start = [ center_pos[0] - patch_size[0]//2, center_pos[1] - patch_size[1]//2, center_pos[2] - patch_size[2]//2 ]
+    return corner_crop(x, src_start, patch_size, default_fill=default_fill)
+
+def masked_mean(data, mask):
+    mask = (mask>0.5).astype('int')
+    masked_data = ma.masked_array(data,mask=1-mask)
+    return masked_data.mean()
+
+def masked_std(data, mask):
+    mask = (mask>0.5).astype('int')
+    masked_data = ma.masked_array(data,mask=1-mask)
+    return masked_data.std()
+
+def z_score(data, mask=None):
+    '''
+    perform z-score normalization for image data.
+    '''
+    data_mean = np.mean(data) if mask is None else masked_mean(data, mask)
+    data_std = np.std(data) if mask is None else masked_std(data, mask)
+    data_std = np.max( [ data_std, 0.00001 ] ) # avoid division by zero
+    return (data - data_mean) / data_std
+
+def barycentric_coordinate(weights: np.ndarray):
+    '''
+    calculate barycentric coordinate for a given 3D image
+    '''
+    assert len(weights.shape) == 3, 'must be a 3D image.'
+    x = np.sum(np.sum(weights, (1,2)) * np.arange(weights.shape[0])) / np.sum(weights)
+    y = np.sum(np.sum(weights, (0,2)) * np.arange(weights.shape[1])) / np.sum(weights)
+    z = np.sum(np.sum(weights, (0,1)) * np.arange(weights.shape[2])) / np.sum(weights)
+    return x,y,z
+
+def connected_components(mask, return_labeled=True):
+    '''
+    Description
+    -----------
+    Get number of connected components and their volumes.
+    0 is considered as background and is not counted in 
+    connected components. If "return_volumes" is True, a
+    list will be returned containing volumes of each component,
+    otherwise a total number of connected component (int) 
+    is returned.
+
+    Usage
+    -----------
+    >>> num_parts, labeled_array = connected_comps(mask)
+    >>> num_parts = connected_comps(mask, return_labeled = False)
+    '''
+    mask = (mask>0.5).astype('int')
+    labeled_array, num_parts = label(mask)
+    if return_labeled:
+        return num_parts, labeled_array
+    else:
+        return num_parts
+
+def max_volume_filter(mask, return_type = 'float32'):
+    num_parts, labeled_array = connected_components(mask)
+    max_vol_id, max_volume = 0, 0
+    for part_id in range(1, num_parts+1):
+        volume = np.sum((labeled_array == part_id).astype('int32'))
+        if volume > max_volume:
+            max_volume = volume
+            max_vol_id = part_id
+    return (labeled_array == part_id).astype(return_type)
+
+def remove_sparks(mask, min_volume=3, verbose=False):
+    '''
+    remove sparks for a given (binarized) image.
+    any component smaller than min_volume will be discarded.
+    '''
+    mask = (mask>0.5).astype('int')
+    if verbose:
+        print('calculating cc...')
+    labeled_array, num_features = label(mask)
+    if verbose:
+        print('%d cc detected.' % num_features)
+    filtered_mask = np.zeros_like(mask) 
+    for i in range(1, num_features+1):
+        v = (labeled_array==i).sum()
+        if v>=min_volume:
+            filtered_mask[labeled_array==i] = 1
+    if verbose:
+        _, n = label(filtered_mask)
+        print('cc after filtering: %d.' % n)
+    return filtered_mask
+
+def find_holes(mask:np.ndarray):
+    '''
+    Find holes in a 3D image.
+    '''
+    assert len(mask.shape) == 3, 'mask must be a 3D image.'
+
+    mask = (mask > 0.5).astype('int32')
+    x = np.zeros( [ mask.shape[0]+2, mask.shape[1]+2, mask.shape[2]+2 ] ).astype('int32')
+    y = np.zeros_like(x)
+    # pad zeros around mask, and treat background of the original image as foreground
+    x[1:1+mask.shape[0], 1:1+mask.shape[1], 1:1+mask.shape[2]] = mask+1
+    y[1:1+mask.shape[0], 1:1+mask.shape[1], 1:1+mask.shape[2]] = mask
+    holes = np.zeros_like(x)
+    num_components, labeled = connected_components(x)
+    for i in range(1, num_components+1):
+        selected = (labeled == i).astype('int32')
+        # for each labeled component, we check if it is the background of the original image
+        if np.sum(y * selected) > 0:
+            continue # no, it is the foreground
+        # ok, we found a background region, using flood fill to detect if it is closed
+        position = np.argwhere(selected>0)[0]
+        z = flood_fill(x, position, -1)
+        if z[0,0,0] == -1:
+            # this background region is not a hole
+            continue
+        # ok, now we find a hole
+        holes += selected
+    return holes
+
+def make_onehot_from_label(label: np.ndarray):
+    label = label.astype('int32')
+    max_label_id = np.max(label)
+    num_channels = max_label_id + 1
+    y = np.zeros([num_channels, *label.shape]).astype('float32')
+    for channel_id in range(num_channels):
+        y[channel_id] = (label == channel_id)
+    return y
 
 def kill_process_tree(pid, kill_self=True):
     try:
@@ -1680,3 +1842,111 @@ class ANTsGroupRegistration(object):
         run_parallel(_parallel_registration, task_list, self.num_workers, "registration", 
                      print_output=False)
         print('registration finished.')
+
+from typing import Union, Tuple
+import warnings
+import matplotlib
+matplotlib.use('agg') 
+import matplotlib.pyplot as plt
+import matplotlib.ticker
+
+#####################################################
+## define some plot functions for general purposes ##
+#####################################################
+
+def single_curve_plot(x,y,save_file,fig_size=(8,6),dpi=80,
+    title=None,xlabel=None,ylabel=None,log_x=False,log_y=False,
+    xlim=None, ylim=None):
+
+    plt.figure('figure',figsize=fig_size,dpi=dpi)
+    plt.plot(x, y, color=[235/255,64/255,52/255])
+    if title is not None: plt.title(title)
+    if xlabel is not None: plt.xlabel(xlabel)
+    if ylabel is not None: plt.ylabel(ylabel)
+    if xlim is not None: plt.xlim(xlim)
+    if ylim is not None: plt.ylim(ylim)
+    if log_x:
+        plt.xscale('log')
+        locmin = matplotlib.ticker.LogLocator(base=10,subs=(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),numticks=100)
+        plt.gca().xaxis.set_minor_locator(locmin)
+        plt.gca().xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    if log_y: 
+        plt.yscale('log')
+        locmin = matplotlib.ticker.LogLocator(base=10,subs=(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),numticks=100)
+        plt.gca().yaxis.set_minor_locator(locmin)
+        plt.gca().yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    plt.grid(which='both',ls='--',lw=1,color=[200/255,200/255,200/255])
+    plt.savefig(save_file)
+    plt.close('figure')
+
+def multi_curve_plot(curve_dict,save_file,fig_size=(8,6),dpi=80,
+    title=None,xlabel=None,ylabel=None,log_x=False,log_y=False,
+    xlim=None, ylim=None, selected_keys:Union[list, None]=None):
+    '''
+    multi_curve_plot: display multiple 2d curves in a single plot
+
+    curve_dict: containing data for drawing. Each key-value pair in this dictionary 
+    represents a single curve, the properties are: 
+        'x': list of x coordinates
+        'y': list of y coordinates
+        'color': curve color
+        'label': show label in legend, can be True or False
+        'ls': line style
+        'lw': line width
+    curve_dict = {
+        'curve1':{
+            'x': [...]
+            'y': [...]
+        },
+        'curve2':{
+            'x': [...]
+            'y': [...]
+        },
+        ...
+    }
+
+    selected_keys: list of curve names that need to be drawn, set to "None" will select all curves.
+    '''
+
+    plt.figure('figure',figsize=fig_size,dpi=dpi)
+
+    curve_names = list(curve_dict.keys())
+    if selected_keys is not None:
+        curve_names0 = [item for item in curve_names if item in selected_keys]
+        curve_names = curve_names0
+
+    has_legend = False
+    for cname in curve_names:
+        x = curve_dict[cname]['x']
+        y = curve_dict[cname]['y']
+        color = curve_dict[cname]['color']
+        ls = '-' if 'ls' not in curve_dict[cname] else curve_dict[cname]['ls']
+        label = cname if ('label' not in curve_dict[cname]) or (curve_dict[cname]['label']==True) else None
+        lw = 1.5 if 'lw' not in curve_dict[cname] else curve_dict[cname]['lw']
+        if label is not None:
+            has_legend = True
+            plt.plot(x, y, color=color,label=label,ls=ls,lw=lw)
+        else:
+            plt.plot(x, y, color=color,ls=ls,lw=lw)
+    if has_legend:
+        plt.legend()
+    if title is not None: plt.title(title)
+    if xlabel is not None: plt.xlabel(xlabel)
+    if ylabel is not None: plt.ylabel(ylabel)
+    if xlim is not None: plt.xlim(xlim)
+    if ylim is not None: plt.ylim(ylim)
+    if log_x:
+        plt.xscale('log')
+        locmin = matplotlib.ticker.LogLocator(base=10,subs=(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),numticks=100)
+        plt.gca().xaxis.set_minor_locator(locmin)
+        plt.gca().xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    if log_y: 
+        plt.yscale('log')
+        locmin = matplotlib.ticker.LogLocator(base=10,subs=(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),numticks=100)
+        plt.gca().yaxis.set_minor_locator(locmin)
+        plt.gca().yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    plt.grid(which='both',ls='--',lw=1,color=[200/255,200/255,200/255])
+    plt.tight_layout(pad=0.2)
+    #plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    plt.savefig(save_file)
+    plt.close('figure')
